@@ -1,0 +1,21 @@
+[package]
+name = "fisherman"
+version = "0.1.0"
+authors = ["Denys Mitin <denisukmol2002@gmail.com>"]
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
+hickory-resolver = "0.26.0"
+ratatui = "0.30.0"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+surge-ping = "0.8"
+tokio = { version = "1.52", features = ["full"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
