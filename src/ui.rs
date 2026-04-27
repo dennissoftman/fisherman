@@ -781,12 +781,37 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn format_interval(ms: u64) -> String {
+pub(crate) fn format_interval(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms % 1000 == 0 {
         format!("{}s", ms / 1000)
     } else {
         format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_interval;
+
+    #[test]
+    fn format_interval_milliseconds() {
+        assert_eq!(format_interval(100), "100ms");
+        assert_eq!(format_interval(500), "500ms");
+        assert_eq!(format_interval(999), "999ms");
+    }
+
+    #[test]
+    fn format_interval_whole_seconds() {
+        assert_eq!(format_interval(1000), "1s");
+        assert_eq!(format_interval(2000), "2s");
+        assert_eq!(format_interval(5000), "5s");
+    }
+
+    #[test]
+    fn format_interval_fractional_seconds() {
+        assert_eq!(format_interval(1500), "1.5s");
+        assert_eq!(format_interval(2500), "2.5s");
     }
 }

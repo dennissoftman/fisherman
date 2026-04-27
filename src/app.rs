@@ -31,6 +31,7 @@ pub enum NetType {
     Wifi,
     Ethernet,
     Other(String),
+    #[allow(dead_code)]
     Unknown,
 }
 
@@ -455,4 +456,155 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
         .nth(1)
         .map(|(i, _)| pos + i)
         .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DnsIpFilter ────────────────────────────────────────────────────────
+
+    #[test]
+    fn dns_filter_cycle_wraps() {
+        assert_eq!(DnsIpFilter::V4Only.cycle(), DnsIpFilter::V6Only);
+        assert_eq!(DnsIpFilter::V6Only.cycle(), DnsIpFilter::Both);
+        assert_eq!(DnsIpFilter::Both.cycle(), DnsIpFilter::V4Only);
+    }
+
+    #[test]
+    fn dns_filter_keeps_flags() {
+        assert!(DnsIpFilter::V4Only.keeps_v4());
+        assert!(!DnsIpFilter::V4Only.keeps_v6());
+        assert!(!DnsIpFilter::V6Only.keeps_v4());
+        assert!(DnsIpFilter::V6Only.keeps_v6());
+        assert!(DnsIpFilter::Both.keeps_v4());
+        assert!(DnsIpFilter::Both.keeps_v6());
+    }
+
+    #[test]
+    fn dns_filter_labels_are_nonempty() {
+        for f in [DnsIpFilter::V4Only, DnsIpFilter::V6Only, DnsIpFilter::Both] {
+            assert!(!f.label().is_empty());
+        }
+    }
+
+    // ── NetType display ────────────────────────────────────────────────────
+
+    #[test]
+    fn net_type_display() {
+        assert_eq!(NetType::Wifi.to_string(), "Wi-Fi");
+        assert_eq!(NetType::Ethernet.to_string(), "Ethernet");
+        assert_eq!(NetType::Other("VPN".into()).to_string(), "VPN");
+        assert_eq!(NetType::Unknown.to_string(), "Unknown");
+    }
+
+    // ── ping_stats ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn ping_stats_none_when_empty() {
+        let app = App::new();
+        assert!(app.ping_stats().is_none());
+    }
+
+    #[test]
+    fn ping_stats_single_value() {
+        let mut app = App::new();
+        app.ping_rtts = vec![42.0];
+        let (min, max, avg, stddev) = app.ping_stats().unwrap();
+        assert_eq!(min, 42.0);
+        assert_eq!(max, 42.0);
+        assert_eq!(avg, 42.0);
+        assert_eq!(stddev, 0.0);
+    }
+
+    #[test]
+    fn ping_stats_known_values() {
+        let mut app = App::new();
+        // min=10, max=30, avg=20, stddev=~8.165
+        app.ping_rtts = vec![10.0, 20.0, 30.0];
+        let (min, max, avg, stddev) = app.ping_stats().unwrap();
+        assert_eq!(min, 10.0);
+        assert_eq!(max, 30.0);
+        assert!((avg - 20.0).abs() < 1e-9);
+        assert!((stddev - (200.0_f64 / 3.0).sqrt()).abs() < 1e-9);
+    }
+
+    // ── ping_loss_pct ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ping_loss_zero_when_no_packets_sent() {
+        let app = App::new();
+        assert_eq!(app.ping_loss_pct(), 0.0);
+    }
+
+    #[test]
+    fn ping_loss_full() {
+        let mut app = App::new();
+        app.ping_timeouts = 4;
+        assert_eq!(app.ping_loss_pct(), 100.0);
+    }
+
+    #[test]
+    fn ping_loss_partial() {
+        let mut app = App::new();
+        app.ping_received = 3;
+        app.ping_timeouts = 1;
+        assert!((app.ping_loss_pct() - 25.0).abs() < 1e-9);
+    }
+
+    // ── ping_interval stepping ─────────────────────────────────────────────
+
+    #[test]
+    fn ping_interval_increase_steps_up() {
+        let app = App::new(); // starts at 1000 ms
+        app.ping_interval_increase();
+        assert_eq!(app.get_ping_interval_ms(), 2000);
+    }
+
+    #[test]
+    fn ping_interval_decrease_steps_down() {
+        let app = App::new(); // starts at 1000 ms
+        app.ping_interval_decrease();
+        assert_eq!(app.get_ping_interval_ms(), 500);
+    }
+
+    #[test]
+    fn ping_interval_does_not_exceed_max() {
+        let app = App::new();
+        for _ in 0..10 {
+            app.ping_interval_increase();
+        }
+        assert_eq!(app.get_ping_interval_ms(), 5000);
+    }
+
+    #[test]
+    fn ping_interval_does_not_go_below_min() {
+        let app = App::new();
+        for _ in 0..10 {
+            app.ping_interval_decrease();
+        }
+        assert_eq!(app.get_ping_interval_ms(), 100);
+    }
+
+    // ── speedtest_visible ──────────────────────────────────────────────────
+
+    #[test]
+    fn speedtest_visible_while_checking() {
+        let app = App::new(); // speedtest_installed = None
+        assert!(app.speedtest_visible());
+    }
+
+    #[test]
+    fn speedtest_visible_when_installed() {
+        let mut app = App::new();
+        app.speedtest_installed = Some(true);
+        assert!(app.speedtest_visible());
+    }
+
+    #[test]
+    fn speedtest_hidden_when_not_installed() {
+        let mut app = App::new();
+        app.speedtest_installed = Some(false);
+        assert!(!app.speedtest_visible());
+    }
 }

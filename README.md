@@ -4,6 +4,7 @@ A terminal UI for network diagnostics — because debugging networks is a lot li
 
 Built with [ratatui](https://github.com/ratatui-org/ratatui) and [tokio](https://tokio.rs) on macOS and Linux.
 
+[![CI](https://github.com/dennissoftman/fisherman/actions/workflows/rust.yml/badge.svg)](https://github.com/dennissoftman/fisherman/actions/workflows/rust.yml)
 ![Rust](https://img.shields.io/badge/rust-2024_edition-orange?logo=rust)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?logo=apple)
 ![License](https://img.shields.io/badge/license-MIT-blue)
