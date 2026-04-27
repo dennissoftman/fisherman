@@ -1,11 +1,47 @@
-use crate::app::{App, InputMode, NetType, Tab};
+use crate::app::{App, InputMode, MtrHop, NetType, Tab};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline, Tabs},
 };
+
+// ── IP redaction ───────────────────────────────────────────────────────────────
+
+/// Replace an IP address with `aaa.bbb.ccc.ddd` where each `a/b/c/d` is a
+/// randomly-looking shade block (█ ▓). The pattern is deterministic per
+/// input character so it stays stable across redraws without needing `rand`.
+fn redact_ip(ip: &str) -> String {
+    const SHADES: [char; 2] = ['█', '▓'];
+    let mut out = String::with_capacity(15);
+    for (seg_idx, _seg) in ip.split('.').enumerate() {
+        if seg_idx > 0 {
+            out.push('.');
+        }
+        for char_idx in 0..3usize {
+            // cheap deterministic "random": mix segment and char index
+            let pick = (seg_idx * 7 + char_idx * 3 + seg_idx ^ char_idx) % 2;
+            out.push(SHADES[pick]);
+        }
+    }
+    out
+}
+
+// ── Toast helper ─────────────────────────────────────────────────────────────────
+
+/// Returns "  ✓ Copied!" if the copy toast is active, empty string otherwise.
+fn toast_str(app: &App) -> &'static str {
+    if app
+        .copy_toast
+        .map(|t| t.elapsed().as_secs() < 2)
+        .unwrap_or(false)
+    {
+        "  ✓ Copied!"
+    } else {
+        ""
+    }
+}
 
 // ── Entry point ────────────────────────────────────────────────────────────────
 
@@ -74,7 +110,7 @@ fn render_tabbar(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" 🎣 fisherman ")
+                .title(format!(" 🎣 fisherman v{} ", env!("CARGO_PKG_VERSION")))
                 .title_style(
                     Style::default()
                         .fg(Color::Cyan)
@@ -99,6 +135,11 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         .title(" Network Status ");
     let inner = outer.inner(area);
     f.render_widget(outer, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
 
     let lbl = Style::default().fg(Color::DarkGray);
     let val_green = Style::default()
@@ -143,7 +184,14 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         Line::default(),
         Line::from(vec![
             Span::styled("  Public IP    : ", lbl),
-            Span::styled(app.public_ip.as_str(), val_green),
+            Span::styled(
+                if app.hide_private {
+                    redact_ip(&app.public_ip)
+                } else {
+                    app.public_ip.clone()
+                },
+                val_green,
+            ),
             Span::styled("   (r to refresh)", val_gray),
         ]),
         Line::default(),
@@ -162,7 +210,14 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  Private IP   : ", lbl),
-            Span::styled(private_ip_str.as_str(), val_white),
+            Span::styled(
+                if app.hide_private {
+                    redact_ip(&private_ip_str)
+                } else {
+                    private_ip_str
+                },
+                val_white,
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Gateway      : ", lbl),
@@ -186,7 +241,12 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    f.render_widget(
+        Paragraph::new(toast_str(app)).style(Style::default().fg(Color::Green)),
+        chunks[1],
+    );
 }
 
 // ── Ping ───────────────────────────────────────────────────────────────────────
@@ -196,13 +256,14 @@ fn render_ping(f: &mut Frame, app: &App, area: Rect) {
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
-    // Layout: input(3) | hint(1) | stats(4) | log(rest)
+    // Layout: input(3) | hint(1) | stats(4) | sparkline(5) | log(rest)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(3),
         ])
         .split(inner);
@@ -235,13 +296,20 @@ fn render_ping(f: &mut Frame, app: &App, area: Rect) {
 
     // Hint line
     let interval_label = format_interval(app.get_ping_interval_ms());
+    let toast = toast_str(app);
     let hint_text: String = if app.ping_running {
-        format!(" ⟳  Pinging ({interval_label})   ·   Press s to stop   ·   +/-: adjust interval")
+        format!(
+            " ⟳  Pinging ({interval_label})   ·   s to stop   ·   +/-: adjust interval   ·   y to copy{toast}"
+        )
     } else if editing {
         " Enter → start continuous ping   ·   Esc → cancel".to_string()
+    } else if !app.ping_results.is_empty() {
+        format!(
+            " Press i or Enter to type a host, then Enter to start   ·   interval: {interval_label} (+/-)   ·   y to copy{toast}"
+        )
     } else {
         format!(
-            " Press i or Enter to type a host, then Enter to start   ·   interval: {interval_label} (+/-) "
+            " Press i or Enter to type a host, then Enter to start   ·   interval: {interval_label} (+/-)"
         )
     };
     let hint_color = if app.ping_running {
@@ -257,8 +325,11 @@ fn render_ping(f: &mut Frame, app: &App, area: Rect) {
     // Stats block
     render_ping_stats(f, app, chunks[2]);
 
+    // RTT sparkline
+    render_ping_sparkline(f, app, chunks[3]);
+
     // Log
-    render_ping_log(f, app, chunks[3]);
+    render_ping_log(f, app, chunks[4]);
 }
 
 fn render_ping_stats(f: &mut Frame, app: &App, area: Rect) {
@@ -315,6 +386,53 @@ fn render_ping_stats(f: &mut Frame, app: &App, area: Rect) {
     };
 
     f.render_widget(Paragraph::new(vec![row1, row2]), inner);
+}
+
+fn render_ping_sparkline(f: &mut Frame, app: &App, area: Rect) {
+    // Trim to the number of bars that actually fit (inner width = area - 2 borders)
+    let bar_capacity = area.width.saturating_sub(2) as usize;
+    let data: Vec<u64> = app
+        .ping_rtt_sparkline
+        .iter()
+        .copied()
+        .rev()
+        .take(bar_capacity)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    // Determine a sensible ceiling (at least 10 ms, or 150% of the visible max)
+    let max_val = data.iter().copied().max().unwrap_or(0).max(10);
+    let ceiling = (max_val as f64 * 1.5).ceil() as u64;
+
+    // Color shifts based on avg of visible data
+    let avg = if data.is_empty() {
+        0.0
+    } else {
+        data.iter().sum::<u64>() as f64 / data.len() as f64
+    };
+    let spark_color = if avg <= 30.0 {
+        Color::Green
+    } else if avg <= 100.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let title = if data.is_empty() {
+        " RTT History ".to_string()
+    } else {
+        format!(" RTT History  │  ceiling: {ceiling} ms ")
+    };
+
+    let sparkline = Sparkline::default()
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .data(&data)
+        .max(ceiling)
+        .style(Style::default().fg(spark_color));
+
+    f.render_widget(sparkline, area);
 }
 
 fn render_ping_log(f: &mut Frame, app: &App, area: Rect) {
@@ -401,12 +519,20 @@ fn render_dns(f: &mut Frame, app: &App, area: Rect) {
         f.set_cursor_position((cx, chunks[0].y + 1));
     }
 
+    let dns_toast = toast_str(app);
+    let dns_hint_owned: String;
     let hint_text: &str = if app.dns_running {
         " ⟳  Resolving…"
     } else if editing {
         " Enter → resolve   ·   Esc → cancel"
+    } else if !app.dns_results.is_empty() {
+        dns_hint_owned = format!(
+            " Press i or Enter to edit   ·   f: cycle IP filter   ·   y to copy{dns_toast}"
+        );
+        &dns_hint_owned
     } else {
-        " Press i or Enter to edit   ·   f: cycle IP filter"
+        dns_hint_owned = " Press i or Enter to edit   ·   f: cycle IP filter".to_string();
+        &dns_hint_owned
     };
     let hint_color = if app.dns_running {
         Color::Yellow
@@ -535,12 +661,17 @@ fn render_traceroute(f: &mut Frame, app: &App, area: Rect) {
         f.set_cursor_position((cx, chunks[0].y + 1));
     }
 
-    let hint_text: &str = if app.traceroute_running {
-        " ⟳  Running traceroute…   ·   Press s to stop"
+    let toast = toast_str(app);
+    let hint_text: String = if app.traceroute_running {
+        format!(" ⧳  Running continuous MTR…   ·   s to stop   ·   y to copy markdown{toast}")
     } else if editing {
-        " Enter → start traceroute   ·   Esc → cancel"
+        " Enter → start   ·   Esc → cancel".to_string()
+    } else if !app.mtr_hops.is_empty() {
+        format!(
+            " Press i or Enter to type a host, then Enter to start   ·   y to copy markdown{toast}"
+        )
     } else {
-        " Press i or Enter to type a host, then Enter to start"
+        " Press i or Enter to type a host, then Enter to start".to_string()
     };
     let hint_color = if app.traceroute_running {
         Color::Yellow
@@ -548,53 +679,158 @@ fn render_traceroute(f: &mut Frame, app: &App, area: Rect) {
         Color::DarkGray
     };
     f.render_widget(
-        Paragraph::new(hint_text).style(Style::default().fg(hint_color)),
+        Paragraph::new(hint_text.as_str()).style(Style::default().fg(hint_color)),
         chunks[1],
     );
 
-    // Output log
-    let title = if app.traceroute_running {
-        " Hops (running) "
-    } else {
-        " Hops "
-    };
-    let log_block = Block::default().borders(Borders::ALL).title(title);
-    let log_inner = log_block.inner(chunks[2]);
-    f.render_widget(log_block, chunks[2]);
+    // Hop visualization
+    render_traceroute_hops(f, app, chunks[2]);
+}
 
-    if app.traceroute_results.is_empty() {
+/// Render the MTR hop table with per-hop inline sparklines.
+fn render_traceroute_hops(f: &mut Frame, app: &App, area: Rect) {
+    let title = if app.traceroute_running {
+        " Continuous MTR (running…) "
+    } else {
+        " Continuous MTR "
+    };
+
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.mtr_hops.is_empty() {
         f.render_widget(
             Paragraph::new("No output yet — enter a host above and press Enter.")
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(Alignment::Center),
-            log_inner,
+            inner,
         );
         return;
     }
 
-    let max = log_inner.height as usize;
-    let skip = app.traceroute_results.len().saturating_sub(max);
-    let items: Vec<ListItem> = app
-        .traceroute_results
-        .iter()
-        .skip(skip)
-        .map(|l| ListItem::new(l.as_str()).style(traceroute_line_style(l)))
-        .collect();
+    // Fixed columns: TTL(5) + IP(23) + LOSS(8) + AVG(10) + BEST(10) + LAST(10) = 66
+    let spark_width = inner.width.saturating_sub(66).max(8) as usize;
 
-    f.render_widget(List::new(items), log_inner);
+    let header = Line::from(Span::styled(
+        format!(
+            " {:<3}  {:<22} {:>6}  {:>8}  {:>8}  {:>8}  HISTORY",
+            "TTL", "ADDRESS", "LOSS", "AVG", "BEST", "LAST"
+        ),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let mut lines: Vec<Line> = vec![header];
+    let redact_ip = if app.hide_private {
+        Some(app.public_ip.as_str())
+    } else {
+        None
+    };
+    for hop in &app.mtr_hops {
+        lines.push(render_mtr_hop_line(hop, spark_width, redact_ip));
+    }
+
+    if app.traceroute_running {
+        lines.push(Line::from(Span::styled(
+            " …",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let max = inner.height as usize;
+    let skip = lines.len().saturating_sub(max);
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
+        inner,
+    );
 }
 
-fn traceroute_line_style(line: &str) -> Style {
-    let lc = line.to_lowercase();
-    if lc.contains("traceroute to") || lc.starts_with("traceroute") {
-        Style::default().fg(Color::Cyan)
-    } else if lc.contains("* * *") || lc.contains("request timeout") {
-        Style::default().fg(Color::Red)
-    } else if lc.contains("error") || lc.contains("failed") || lc.contains("no route") {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+fn render_mtr_hop_line(hop: &MtrHop, spark_width: usize, redact_ip: Option<&str>) -> Line<'static> {
+    let loss_pct = hop.loss_pct();
+
+    let ttl_span = Span::styled(
+        format!(" {:>3}  ", hop.ttl),
+        Style::default().fg(Color::DarkGray),
+    );
+
+    let raw_ip = hop.ip.as_deref().unwrap_or("*");
+    let ip_str = match redact_ip {
+        Some(pub_ip) if raw_ip == pub_ip => self::redact_ip(raw_ip),
+        _ => raw_ip.to_string(),
+    };
+    let ip_color = if hop.received == 0 && hop.sent > 0 {
+        Color::DarkGray
     } else {
-        // Hop lines: dim the hop number, highlight the IP/time in white/green
-        Style::default().fg(Color::Green)
+        Color::Cyan
+    };
+    let ip_span = Span::styled(format!("{:<22} ", ip_str), Style::default().fg(ip_color));
+
+    let loss_color = if loss_pct == 0.0 {
+        Color::Green
+    } else if loss_pct < 50.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+    let loss_span = Span::styled(
+        format!("{:>5.1}%  ", loss_pct),
+        Style::default().fg(loss_color),
+    );
+
+    let fmt_rtt = |v: Option<f64>| -> String {
+        v.map(|ms| format!("{:>6.2}ms", ms))
+            .unwrap_or_else(|| format!("{:>8}", "-"))
+    };
+
+    let avg = hop.avg_rtt();
+    let avg_color = avg.map(rtt_color).unwrap_or(Color::DarkGray);
+    let avg_span = Span::styled(
+        format!("{}  ", fmt_rtt(avg)),
+        Style::default().fg(avg_color),
+    );
+    let best_span = Span::styled(
+        format!("{}  ", fmt_rtt(hop.best_rtt())),
+        Style::default().fg(Color::Green),
+    );
+    let last_span = Span::styled(
+        format!("{}  ", fmt_rtt(hop.last_rtt())),
+        Style::default().fg(avg.map(rtt_color).unwrap_or(Color::DarkGray)),
+    );
+
+    // Inline sparkline using block elements ▁▂▃▄▅▆▇█
+    let spark = hop.sparkline_data(spark_width);
+    let max_val = spark.iter().copied().max().unwrap_or(1).max(1);
+    let bar_chars = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let spark_str: String = spark
+        .iter()
+        .map(|&v| {
+            if v == 0 {
+                '░' // timeout / no data
+            } else {
+                let idx = ((v as f64 / max_val as f64) * 8.0).round() as usize;
+                bar_chars[idx.min(8)]
+            }
+        })
+        .collect();
+    let spark_span = Span::styled(
+        spark_str,
+        Style::default().fg(avg.map(rtt_color).unwrap_or(Color::DarkGray)),
+    );
+
+    Line::from(vec![
+        ttl_span, ip_span, loss_span, avg_span, best_span, last_span, spark_span,
+    ])
+}
+
+fn rtt_color(ms: f64) -> Color {
+    if ms < 20.0 {
+        Color::Green
+    } else if ms < 100.0 {
+        Color::Yellow
+    } else {
+        Color::Red
     }
 }
 
@@ -662,10 +898,15 @@ fn render_speedtest(f: &mut Frame, app: &App, area: Rect) {
                 .constraints([Constraint::Length(1), Constraint::Min(3)])
                 .split(inner);
 
+            let speedtest_toast = toast_str(app);
             let hint_text = if app.speedtest_running {
                 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let frame = SPINNER[(app.spin_tick as usize) % SPINNER.len()];
-                format!(" {frame}  Running speedtest…   ·   Press s or Enter to stop")
+                format!(
+                    " {frame}  Running speedtest…   ·   s or Enter to stop   ·   y to copy{speedtest_toast}"
+                )
+            } else if !app.speedtest_lines.is_empty() {
+                format!(" Press Enter or s to run speedtest   ·   y to copy{speedtest_toast}")
             } else {
                 " Press Enter or s to run speedtest".to_string()
             };
@@ -754,20 +995,37 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             format!(" s / Enter: stop speedtest  │  {tabs_hint}  │  q: quit ")
         }
         (_, Tab::Dashboard) => {
-            format!(" r: refresh  │  {tabs_hint}  │  q / Ctrl-C: quit ")
+            format!(" r: refresh  │  y: copy  │  {tabs_hint}  │  q / Ctrl-C: quit ")
         }
         (_, Tab::Ping) => format!(
-            " +/-: interval ({interval_label})  │  i / Enter: start ping  │  {tabs_hint}  │  q: quit "
+            " +/-: interval ({interval_label})  │  i / Enter: start ping{}  │  {tabs_hint}  │  q: quit ",
+            if app.ping_results.is_empty() {
+                ""
+            } else {
+                "  │  y: copy"
+            }
         ),
         (_, Tab::Dns) => format!(
-            " f: cycle filter ({})  │  i / Enter: edit  │  {tabs_hint}  │  q: quit ",
-            app.dns_ip_filter.label()
+            " f: cycle filter ({})  │  i / Enter: edit{}  │  {tabs_hint}  │  q: quit ",
+            app.dns_ip_filter.label(),
+            if app.dns_results.is_empty() {
+                ""
+            } else {
+                "  │  y: copy"
+            }
         ),
         (_, Tab::Traceroute) if !app.traceroute_running => {
-            format!(" i / Enter: start traceroute  │  {tabs_hint}  │  q: quit ")
+            format!(
+                " i / Enter: start traceroute{}  │  {tabs_hint}  │  q: quit ",
+                if app.mtr_hops.is_empty() {
+                    ""
+                } else {
+                    "  │  y: copy"
+                }
+            )
         }
         (_, Tab::Traceroute) => {
-            format!(" s: stop  │  {tabs_hint}  │  q: quit ")
+            format!(" s: stop  │  y: copy  │  {tabs_hint}  │  q: quit ")
         }
         _ => format!(" {tabs_hint}  │  i / Enter: edit input  │  q: quit "),
     };

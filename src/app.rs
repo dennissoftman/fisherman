@@ -3,7 +3,94 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Instant;
 use tokio::sync::oneshot;
+
+// ── MTR hop ──────────────────────────────────────────────────────────────────────────────
+
+/// History cap per hop for the sparkline.
+pub const MTR_SPARKLINE_LEN: usize = 200;
+
+#[derive(Debug, Clone)]
+pub struct MtrHop {
+    pub ttl: u8,
+    /// IP that replied; None until first probe arrives.
+    pub ip: Option<String>,
+    pub sent: u32,
+    pub received: u32,
+    /// Ring buffer of RTTs (None = timeout for that probe).
+    pub rtt_history: VecDeque<Option<f64>>,
+}
+
+impl MtrHop {
+    pub fn new(ttl: u8) -> Self {
+        Self {
+            ttl,
+            ip: None,
+            sent: 0,
+            received: 0,
+            rtt_history: VecDeque::with_capacity(MTR_SPARKLINE_LEN),
+        }
+    }
+
+    pub fn record(&mut self, ip: Option<String>, rtt: Option<f64>) {
+        if let Some(addr) = ip {
+            self.ip = Some(addr);
+        }
+        self.sent += 1;
+        if rtt.is_some() {
+            self.received += 1;
+        }
+        if self.rtt_history.len() >= MTR_SPARKLINE_LEN {
+            self.rtt_history.pop_front();
+        }
+        self.rtt_history.push_back(rtt);
+    }
+
+    pub fn loss_pct(&self) -> f64 {
+        if self.sent == 0 {
+            return 0.0;
+        }
+        (self.sent - self.received) as f64 / self.sent as f64 * 100.0
+    }
+
+    pub fn avg_rtt(&self) -> Option<f64> {
+        let vals: Vec<f64> = self.rtt_history.iter().filter_map(|r| *r).collect();
+        if vals.is_empty() {
+            None
+        } else {
+            Some(vals.iter().sum::<f64>() / vals.len() as f64)
+        }
+    }
+
+    pub fn last_rtt(&self) -> Option<f64> {
+        self.rtt_history.back().and_then(|r| *r)
+    }
+
+    /// Best (minimum) RTT among the history.
+    pub fn best_rtt(&self) -> Option<f64> {
+        self.rtt_history.iter().filter_map(|r| *r).reduce(f64::min)
+    }
+
+    /// Worst (maximum) RTT among the history.
+    #[allow(dead_code)]
+    pub fn worst_rtt(&self) -> Option<f64> {
+        self.rtt_history.iter().filter_map(|r| *r).reduce(f64::max)
+    }
+
+    /// Sparkline data (u64 ms, 0 for timeouts) for the last `width` entries.
+    pub fn sparkline_data(&self, width: usize) -> Vec<u64> {
+        self.rtt_history
+            .iter()
+            .rev()
+            .take(width)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|r| r.map(|v| v.round() as u64).unwrap_or(0))
+            .collect()
+    }
+}
 
 // ── Tab selection ──────────────────────────────────────────────────────────────
 
@@ -105,8 +192,12 @@ pub enum AppMessage {
     DnsResult(Vec<String>, f64), // results, latency_ms
     DnsDone,
     // Traceroute
-    TracerouteLine(String),
-    TracerouteDone,
+    MtrHopUpdate {
+        ttl: u8,
+        ip: Option<String>,
+        rtt: Option<f64>,
+    },
+    MtrDone,
     // Speedtest
     SpeedtestInstalled(bool),
     SpeedtestLine(String),
@@ -139,12 +230,22 @@ pub struct App {
     // ── Ping tab interval ──
     pub ping_interval_ms: Arc<AtomicU64>,
 
-    // ── Traceroute tab ──
+    // ── Ping sparkline (RTT history in ms, capped at 9999) ──
+    pub ping_rtt_sparkline: VecDeque<u64>,
+
+    // ── Dashboard privacy flag ──
+    pub hide_private: bool,
+
+    // ── Traceroute (MTR continuous) tab ──
     pub traceroute_input: String,
     pub traceroute_cursor: usize,
-    pub traceroute_results: VecDeque<String>,
+    /// Target hostname/IP as resolved for display.
+    pub traceroute_target: Option<String>,
+    pub mtr_hops: Vec<MtrHop>,
     pub traceroute_running: bool,
     pub traceroute_cancel_tx: Option<oneshot::Sender<()>>,
+    /// Set to Some(Instant::now()) when user copies to clipboard; used for toast.
+    pub copy_toast: Option<Instant>,
 
     // ── DNS tab ──
     pub dns_input: String,
@@ -163,7 +264,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(hide_private: bool) -> Self {
         Self {
             active_tab: Tab::Dashboard,
             input_mode: InputMode::Normal,
@@ -171,9 +272,11 @@ impl App {
             spin_tick: 0,
             public_ip: "Fetching…".to_string(),
             network_info: None,
+            hide_private,
             ping_input: String::new(),
             ping_cursor: 0,
             ping_results: VecDeque::new(),
+            ping_rtt_sparkline: VecDeque::with_capacity(200),
             ping_running: false,
             ping_rtts: Vec::new(),
             ping_received: 0,
@@ -182,9 +285,11 @@ impl App {
             ping_interval_ms: Arc::new(AtomicU64::new(1000)),
             traceroute_input: String::new(),
             traceroute_cursor: 0,
-            traceroute_results: VecDeque::new(),
+            traceroute_target: None,
+            mtr_hops: Vec::new(),
             traceroute_running: false,
             traceroute_cancel_tx: None,
+            copy_toast: None,
             dns_input: String::new(),
             dns_cursor: 0,
             dns_results: Vec::new(),
@@ -366,6 +471,12 @@ impl App {
                     if let Some(rtt) = parse_rtt(line) {
                         self.ping_rtts.push(rtt);
                         self.ping_received += 1;
+                        // Push to sparkline (ms, capped at 9999)
+                        let ms_u64 = rtt.round().max(0.0).min(9999.0) as u64;
+                        if self.ping_rtt_sparkline.len() >= 200 {
+                            self.ping_rtt_sparkline.pop_front();
+                        }
+                        self.ping_rtt_sparkline.push_back(ms_u64);
                     }
                 } else if line.to_lowercase().contains("request timeout")
                     || line.contains("No route")
@@ -392,15 +503,19 @@ impl App {
             AppMessage::DnsDone => {
                 self.dns_running = false;
             }
-            AppMessage::TracerouteLine(line) => {
-                if !line.trim().is_empty() {
-                    if self.traceroute_results.len() >= 64 {
-                        self.traceroute_results.pop_front();
+            AppMessage::MtrHopUpdate { ttl, ip, rtt } => {
+                // Grow the hops vec to fit this TTL
+                let idx = (ttl as usize).saturating_sub(1);
+                if self.mtr_hops.len() <= idx {
+                    self.mtr_hops.resize_with(idx + 1, || MtrHop::new(ttl));
+                    // Fix TTL values for any gap-filled entries
+                    for (i, h) in self.mtr_hops.iter_mut().enumerate() {
+                        h.ttl = (i + 1) as u8;
                     }
-                    self.traceroute_results.push_back(line);
                 }
+                self.mtr_hops[idx].record(ip, rtt);
             }
-            AppMessage::TracerouteDone => {
+            AppMessage::MtrDone => {
                 self.traceroute_running = false;
                 self.traceroute_cancel_tx = None;
             }
@@ -502,13 +617,13 @@ mod tests {
 
     #[test]
     fn ping_stats_none_when_empty() {
-        let app = App::new();
+        let app = App::new(false);
         assert!(app.ping_stats().is_none());
     }
 
     #[test]
     fn ping_stats_single_value() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         app.ping_rtts = vec![42.0];
         let (min, max, avg, stddev) = app.ping_stats().unwrap();
         assert_eq!(min, 42.0);
@@ -519,7 +634,7 @@ mod tests {
 
     #[test]
     fn ping_stats_known_values() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         // min=10, max=30, avg=20, stddev=~8.165
         app.ping_rtts = vec![10.0, 20.0, 30.0];
         let (min, max, avg, stddev) = app.ping_stats().unwrap();
@@ -533,20 +648,20 @@ mod tests {
 
     #[test]
     fn ping_loss_zero_when_no_packets_sent() {
-        let app = App::new();
+        let app = App::new(false);
         assert_eq!(app.ping_loss_pct(), 0.0);
     }
 
     #[test]
     fn ping_loss_full() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         app.ping_timeouts = 4;
         assert_eq!(app.ping_loss_pct(), 100.0);
     }
 
     #[test]
     fn ping_loss_partial() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         app.ping_received = 3;
         app.ping_timeouts = 1;
         assert!((app.ping_loss_pct() - 25.0).abs() < 1e-9);
@@ -556,21 +671,21 @@ mod tests {
 
     #[test]
     fn ping_interval_increase_steps_up() {
-        let app = App::new(); // starts at 1000 ms
+        let app = App::new(false); // starts at 1000 ms
         app.ping_interval_increase();
         assert_eq!(app.get_ping_interval_ms(), 2000);
     }
 
     #[test]
     fn ping_interval_decrease_steps_down() {
-        let app = App::new(); // starts at 1000 ms
+        let app = App::new(false); // starts at 1000 ms
         app.ping_interval_decrease();
         assert_eq!(app.get_ping_interval_ms(), 500);
     }
 
     #[test]
     fn ping_interval_does_not_exceed_max() {
-        let app = App::new();
+        let app = App::new(false);
         for _ in 0..10 {
             app.ping_interval_increase();
         }
@@ -579,7 +694,7 @@ mod tests {
 
     #[test]
     fn ping_interval_does_not_go_below_min() {
-        let app = App::new();
+        let app = App::new(false);
         for _ in 0..10 {
             app.ping_interval_decrease();
         }
@@ -590,20 +705,20 @@ mod tests {
 
     #[test]
     fn speedtest_visible_while_checking() {
-        let app = App::new(); // speedtest_installed = None
+        let app = App::new(false); // speedtest_installed = None
         assert!(app.speedtest_visible());
     }
 
     #[test]
     fn speedtest_visible_when_installed() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         app.speedtest_installed = Some(true);
         assert!(app.speedtest_visible());
     }
 
     #[test]
     fn speedtest_hidden_when_not_installed() {
-        let mut app = App::new();
+        let mut app = App::new(false);
         app.speedtest_installed = Some(false);
         assert!(!app.speedtest_visible());
     }

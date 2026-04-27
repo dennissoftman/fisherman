@@ -1,7 +1,7 @@
 [package]
 name = "fisherman"
 description = "Network analysis TUI utility for macOS and Linux"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Denys Mitin <denisukmol2002@gmail.com>"]
 license = "MIT"
 edition = "2024"
@@ -9,6 +9,7 @@ repository = "https://github.com/dennissoftman/fisherman"
 homepage = "https://github.com/dennissoftman/fisherman"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
 hickory-resolver = "0.26.0"

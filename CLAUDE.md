@@ -66,9 +66,12 @@ main loop applies them to `App` state before the next draw call.
 ### Traceroute tab (`4` or `Tab`)
 
 - Same edit-mode flow as Ping.
-- Runs `traceroute -n <host>` via `tokio::process::Command`, streams output line-by-line.
+- Runs **continuous MTR** (`stream_mtr`): repeatedly spawns `traceroute -n -w 1 -q 1 <host>` in a loop (2 s between rounds), accumulating per-hop statistics.
+- Each hop tracks: TTL, IP, sent/received probes, loss %, and a ring-buffer of RTT samples used to render a sparkline.
+- Table columns: `TTL | ADDRESS | LOSS% | AVG | BEST | LAST | HISTORY (sparkline)`.
 - Press `s` to stop mid-run.
-- Uses the same subprocess streaming pattern as Speedtest.
+- Press `y` to copy the current hop table as a Markdown table to the clipboard (shows a brief toast confirmation).
+- Uses `AppMessage::MtrHopUpdate { ttl, ip, rtt }` and `AppMessage::MtrDone`.
 
 ### DNS tab (`5` or `Tab`)
 
@@ -103,6 +106,7 @@ main loop applies them to `App` state before the next draw call.
 | `-`                        | Normal (Ping)                   | Decrease ping interval                                          |
 | `i` or `Enter`             | Normal (Traceroute, not running) | Enter editing mode                                             |
 | `s`                        | Normal (Traceroute, running)    | Stop traceroute                                                 |
+| `y`                        | Normal (any tab, results available) | Copy current tab results to clipboard           |
 | `i` or `Enter`             | Normal (DNS)                    | Enter editing mode                                              |
 | `f`                        | Normal (DNS)                    | Cycle IP filter: IPv4 only → IPv6 only → both                   |
 | `Enter` or `s`             | Normal (Speedtest)              | Start / stop speedtest                                          |
@@ -126,6 +130,7 @@ main loop applies them to `App` state before the next draw call.
 | `reqwest`            | 0.13 (rustls-tls) | HTTP for ipify public-IP lookup      |
 | `hickory-resolver`   | 0.26              | Async DNS resolution                 |
 | `surge-ping`         | 0.8               | Raw ICMP echo (no OS subprocess)     |
+| `clap`               | 4 (derive)        | CLI argument parsing (`-P` flag)     |
 | `color-eyre`         | 0.6               | Error formatting                     |
 
 ---
@@ -157,6 +162,9 @@ Note: Ping does **not** use a subprocess — it uses **surge-ping** (raw ICMP) d
   denies raw socket creation to regular users. The error `"Socket error: Operation not\n  permitted"` will appear in the reply log if permissions are insufficient.
 - `speedtest` must be the Ookla CLI (`speedtest` binary), not `speedtest-cli` (the Python one).
   Both work but their output formats differ slightly.
+- `-P` / `--private` flag: redacts public and private IP addresses in the UI, replacing each
+  digit with a deterministic shade block (`█` / `▓`), always shown as `aaa.bbb.ccc.ddd`
+  regardless of actual digit count. Useful for demos and screenshots.
 
 ---
 

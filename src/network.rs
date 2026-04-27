@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use surge_ping::{Client, Config, ICMP, IcmpPacket, PingIdentifier, PingSequence, SurgeError};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
@@ -398,64 +398,129 @@ pub async fn run_dns(host: &str) -> (Vec<String>, f64) {
     (results, latency_ms)
 }
 
-// ── Traceroute ─────────────────────────────────────────────────────────────────
+// ── Continuous MTR (repeated traceroute subprocess) ───────────────────────────
 
-/// Streams `traceroute -n <host>` output line-by-line.
-/// Stops when `cancel_rx` fires or the process exits.
-pub async fn stream_traceroute(
+/// Pause between full traceroute rounds in ms.
+const MTR_ROUND_INTERVAL_MS: u64 = 2000;
+
+/// Parses a traceroute hop line into (ttl, ip, rtt_ms).
+/// Returns None for lines that aren't hop lines.
+fn parse_mtr_line(line: &str) -> Option<(u8, Option<String>, Option<f64>)> {
+    let trimmed = line.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let ttl: u8 = parts.next()?.trim().parse().ok()?;
+    let rest = parts.next()?.trim();
+
+    if rest.starts_with('*') {
+        return Some((ttl, None, None));
+    }
+
+    let mut tokens = rest.split_whitespace();
+    let ip = tokens.next()?.to_string();
+    // Find the first numeric token (RTT value), skip the "ms" after it
+    let rtt = tokens.find_map(|t| t.parse::<f64>().ok());
+
+    Some((ttl, Some(ip), rtt))
+}
+
+/// Continuously runs `traceroute -n -w 1 -q 1 <host>` in a loop.
+/// Each hop line is sent as an MtrHopUpdate. Stops on cancel.
+pub async fn stream_mtr(
     host: String,
     tx: mpsc::Sender<AppMessage>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
-    let mut child = match Command::new("traceroute")
-        .args(["-n", &host])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx
-                .send(AppMessage::TracerouteLine(format!(
-                    "Failed to run traceroute: {e}"
-                )))
-                .await;
-            let _ = tx.send(AppMessage::TracerouteDone).await;
-            return;
-        }
-    };
-
-    // Merge stderr into the same log
-    if let Some(stderr) = child.stderr.take() {
-        let tx2 = tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(l)) = lines.next_line().await {
-                let _ = tx2.send(AppMessage::TracerouteLine(l)).await;
+    'outer: loop {
+        let mut child = match Command::new("traceroute")
+            .args(["-n", "-w", "1", "-q", "1", &host])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx
+                    .send(AppMessage::MtrHopUpdate {
+                        ttl: 1,
+                        ip: Some(format!("Failed to run traceroute: {e}")),
+                        rtt: None,
+                    })
+                    .await;
+                let _ = tx.send(AppMessage::MtrDone).await;
+                return;
             }
-        });
-    }
+        };
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut lines = BufReader::new(stdout).lines();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut lines = BufReader::new(stdout).lines();
 
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut cancel_rx => {
-                let _ = child.kill().await;
-                break;
-            }
-            result = lines.next_line() => {
-                match result {
-                    Ok(Some(l)) => { let _ = tx.send(AppMessage::TracerouteLine(l)).await; }
-                    _ => break,
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut cancel_rx => {
+                    let _ = child.kill().await;
+                    break 'outer;
+                }
+                result = lines.next_line() => {
+                    match result {
+                        Ok(Some(line)) => {
+                            if let Some((ttl, ip, rtt)) = parse_mtr_line(&line) {
+                                let _ = tx.send(AppMessage::MtrHopUpdate { ttl, ip, rtt }).await;
+                            }
+                        }
+                        _ => break, // process ended, start next round
+                    }
                 }
             }
         }
+
+        let _ = child.wait().await;
+
+        // Wait between rounds, cancellable
+        tokio::select! {
+            biased;
+            _ = &mut cancel_rx => break,
+            _ = tokio::time::sleep(Duration::from_millis(MTR_ROUND_INTERVAL_MS)) => {}
+        }
     }
 
-    let _ = tx.send(AppMessage::TracerouteDone).await;
+    let _ = tx.send(AppMessage::MtrDone).await;
+}
+
+// ── Clipboard helper ──────────────────────────────────────────────────────────
+
+/// Copies `text` to the system clipboard.  Returns true on success.
+pub async fn copy_to_clipboard(text: String) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes()).await;
+            }
+            return child.wait().await.map(|s| s.success()).unwrap_or(false);
+        }
+    }
+
+    // Linux: try wl-copy (Wayland), then xclip, then xsel
+    for args in [
+        vec!["wl-copy"],
+        vec!["xclip", "-selection", "clipboard"],
+        vec!["xsel", "--clipboard", "--input"],
+    ] {
+        if let Ok(mut child) = Command::new(args[0])
+            .args(&args[1..])
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes()).await;
+            }
+            if child.wait().await.map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ── Speedtest ─────────────────────────────────────────────────────────────────

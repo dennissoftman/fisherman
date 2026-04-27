@@ -3,6 +3,7 @@ mod network;
 mod ui;
 
 use app::{App, AppMessage, InputMode, Tab};
+use clap::Parser;
 use color_eyre::eyre::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -13,9 +14,22 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
+// ── CLI ──────────────────────────────────────────────────────────────────────────────
+
+/// 🎣 fisherman — Network analysis TUI utility
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Cli {
+    /// Redact public and private IP addresses (useful for demos / screenshots)
+    #[arg(short = 'P', long)]
+    private: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+
+    let cli = Cli::parse();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -23,7 +37,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, cli).await;
 
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
@@ -32,8 +46,8 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    let mut app = App::new();
+async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, cli: Cli) -> Result<()> {
+    let mut app = App::new(cli.private);
 
     let (msg_tx, mut msg_rx) = mpsc::channel::<AppMessage>(128);
 
@@ -203,7 +217,7 @@ async fn handle_key(app: &mut App, key: event::KeyEvent, msg_tx: &mpsc::Sender<A
                 app.input_mode = InputMode::Editing;
             }
 
-            // Traceroute: stop if running, enter edit mode if idle
+            // Traceroute: stop if running, enter edit mode if idle; y to copy
             KeyCode::Char('s') if app.active_tab == Tab::Traceroute && app.traceroute_running => {
                 if let Some(tx) = app.traceroute_cancel_tx.take() {
                     let _ = tx.send(());
@@ -213,6 +227,17 @@ async fn handle_key(app: &mut App, key: event::KeyEvent, msg_tx: &mpsc::Sender<A
                 if app.active_tab == Tab::Traceroute && !app.traceroute_running =>
             {
                 app.input_mode = InputMode::Editing;
+            }
+
+            // y to copy current tab results to clipboard (all tabs)
+            KeyCode::Char('y') => {
+                let text = build_copy_text(app);
+                if !text.is_empty() {
+                    app.copy_toast = Some(std::time::Instant::now());
+                    tokio::spawn(async move {
+                        network::copy_to_clipboard(text).await;
+                    });
+                }
             }
 
             // DNS: cycle IP filter
@@ -264,6 +289,7 @@ async fn dispatch_action(app: &mut App, msg_tx: &mpsc::Sender<AppMessage>) {
             app.ping_running = true;
             app.ping_results.clear();
             app.ping_rtts.clear();
+            app.ping_rtt_sparkline.clear();
             app.ping_received = 0;
             app.ping_timeouts = 0;
 
@@ -282,14 +308,16 @@ async fn dispatch_action(app: &mut App, msg_tx: &mpsc::Sender<AppMessage>) {
                 return;
             }
             app.traceroute_running = true;
-            app.traceroute_results.clear();
+            app.traceroute_target = Some(host.clone());
+            app.mtr_hops.clear();
+            app.copy_toast = None;
 
             let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             app.traceroute_cancel_tx = Some(cancel_tx);
 
             let tx = msg_tx.clone();
             tokio::spawn(async move {
-                network::stream_traceroute(host, tx, cancel_rx).await;
+                network::stream_mtr(host, tx, cancel_rx).await;
             });
         }
         Tab::Dns => {
@@ -309,6 +337,129 @@ async fn dispatch_action(app: &mut App, msg_tx: &mpsc::Sender<AppMessage>) {
         }
         Tab::Dashboard | Tab::Speedtest => {}
     }
+}
+
+/// Dispatches clipboard copy for whichever tab is active.
+fn build_copy_text(app: &App) -> String {
+    match app.active_tab {
+        Tab::Dashboard => build_dashboard_copy(app),
+        Tab::Ping => build_ping_copy(app),
+        Tab::Traceroute => build_mtr_markdown(app),
+        Tab::Dns => build_dns_copy(app),
+        Tab::Speedtest => build_speedtest_copy(app),
+    }
+}
+
+fn build_dashboard_copy(app: &App) -> String {
+    let info = match &app.network_info {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    format!(
+        "## Network Status\n\n\
+         - **Public IP:** {}\n\
+         - **Network Type:** {}\n\
+         - **Name / SSID:** {}\n\
+         - **Interface:** {}\n\
+         - **Private IP:** {}\n\
+         - **Gateway:** {}\n\
+         - **DNS Servers:** {}\n",
+        app.public_ip,
+        info.net_type,
+        info.name,
+        info.interface,
+        info.private_ip.as_deref().unwrap_or("—"),
+        info.gateway_ip.as_deref().unwrap_or("—"),
+        if info.dns_servers.is_empty() {
+            "—".to_string()
+        } else {
+            info.dns_servers.join(", ")
+        },
+    )
+}
+
+fn build_ping_copy(app: &App) -> String {
+    if app.ping_results.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("## Ping {}\n\n", app.ping_input.trim());
+    for line in &app.ping_results {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !app.ping_rtts.is_empty() {
+        let n = app.ping_rtts.len() as f64;
+        let avg = app.ping_rtts.iter().sum::<f64>() / n;
+        let min = app.ping_rtts.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = app
+            .ping_rtts
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let stddev = (app.ping_rtts.iter().map(|r| (r - avg).powi(2)).sum::<f64>() / n).sqrt();
+        out.push_str(&format!(
+            "\n**Stats:** sent={} recv={} loss={:.1}%  min={:.2} avg={:.2} max={:.2} stddev={:.2} ms\n",
+            app.ping_received + app.ping_timeouts,
+            app.ping_received,
+            app.ping_timeouts as f64 / (app.ping_received + app.ping_timeouts).max(1) as f64 * 100.0,
+            min, avg, max, stddev,
+        ));
+    }
+    out
+}
+
+fn build_dns_copy(app: &App) -> String {
+    if app.dns_results.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("## DNS results for {}\n\n", app.dns_input.trim());
+    for r in &app.dns_results {
+        out.push_str(&format!("- {r}\n"));
+    }
+    if let Some(ms) = app.dns_latency_ms {
+        out.push_str(&format!("\n**Latency:** {ms:.2} ms\n"));
+    }
+    out
+}
+
+fn build_speedtest_copy(app: &App) -> String {
+    if app.speedtest_lines.is_empty() {
+        return String::new();
+    }
+    let mut out = "## Speedtest results\n\n".to_string();
+    for line in &app.speedtest_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Builds a Markdown table of the current MTR results for clipboard export.
+fn build_mtr_markdown(app: &App) -> String {
+    if app.mtr_hops.is_empty() {
+        return String::new();
+    }
+    let target = app.traceroute_target.as_deref().unwrap_or("unknown");
+    let mut out = format!("## Traceroute to {target}\n\n");
+    out.push_str("| TTL | Address | Loss | Avg | Best | Last |\n");
+    out.push_str("|-----|---------|------|-----|------|------|\n");
+    for hop in &app.mtr_hops {
+        let ip = hop.ip.as_deref().unwrap_or("*");
+        let fmt = |v: Option<f64>| {
+            v.map(|ms| format!("{ms:.2} ms"))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        out.push_str(&format!(
+            "| {:>3} | {:<22} | {:>5.1}% | {} | {} | {} |\n",
+            hop.ttl,
+            ip,
+            hop.loss_pct(),
+            fmt(hop.avg_rtt()),
+            fmt(hop.best_rtt()),
+            fmt(hop.last_rtt()),
+        ));
+    }
+    out
 }
 
 /// Toggles speedtest start/stop.

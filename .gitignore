@@ -1,2 +1,6 @@
+# Ignore build artifacts
 target
+# Ignore Visual Studio Code settings
 .vscode
+# Ignore SSH keys
+.ssh
