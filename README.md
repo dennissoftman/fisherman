@@ -31,7 +31,7 @@ Built with [ratatui](https://github.com/ratatui-org/ratatui) and [tokio](https:/
 - [Rust toolchain](https://rustup.rs) (stable, 2024 edition)
 
 ```bash
-git clone https://github.com/your-username/fisherman
+git clone https://github.com/dennissoftman/fisherman
 cd fisherman
 cargo build --release
 ./target/release/fisherman
