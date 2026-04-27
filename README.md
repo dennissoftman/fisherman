@@ -25,10 +25,30 @@ Built with [ratatui](https://github.com/ratatui-org/ratatui) and [tokio](https:/
 
 ## Installation
 
-### Prerequisites
+### Homebrew (recommended)
 
-- macOS or Linux
-- [Rust toolchain](https://rustup.rs) (stable, 2024 edition)
+The easiest way to install fisherman on macOS or Linux is via Homebrew:
+
+```bash
+brew tap dennissoftman/fisherman
+brew install fisherman
+```
+
+This taps the [fisherman formula tap](https://github.com/dennissoftman/homebrew-fisherman) and installs a pre-built binary. Once installed, just run:
+
+```bash
+fisherman
+```
+
+To upgrade to the latest version later:
+
+```bash
+brew upgrade fisherman
+```
+
+### Build from source
+
+If you prefer to build from source, you'll need the [Rust toolchain](https://rustup.rs) (stable, 2024 edition):
 
 ```bash
 git clone https://github.com/dennissoftman/fisherman
